@@ -1,4 +1,4 @@
-"""Flight alerts using production Amadeus prices and persistent deduplication."""
+"""Flight alerts using live Duffel prices and persistent deduplication."""
 import argparse
 import datetime as dt
 import hashlib
@@ -11,6 +11,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from decimal import Decimal
+from zoneinfo import ZoneInfo
 
 
 class APIError(RuntimeError):
@@ -36,27 +37,43 @@ def required(name):
     return value
 
 
-class Amadeus:
+class Duffel:
     def __init__(self):
-        self.base = "https://api.amadeus.com"
-        self.client = required("AMADEUS_CLIENT_ID")
-        self.secret = required("AMADEUS_CLIENT_SECRET")
-        self.token = None
-        self.expires = 0
+        self.token = required("DUFFEL_ACCESS_TOKEN")
 
     def search(self, origin, destination, departure, returning):
-        if time.monotonic() >= self.expires:
-            body = urllib.parse.urlencode({"grant_type": "client_credentials",
-                "client_id": self.client, "client_secret": self.secret}).encode()
-            result = request_json(self.base + "/v1/security/oauth2/token", body,
-                                  {"Content-Type": "application/x-www-form-urlencoded"})
-            self.token = result["access_token"]
-            self.expires = time.monotonic() + max(1, int(result["expires_in"]) - 60)
-        query = urllib.parse.urlencode({"originLocationCode": origin,
-            "destinationLocationCode": destination, "departureDate": departure,
-            "returnDate": returning, "adults": 1, "currencyCode": "EUR", "max": 50})
-        return request_json(self.base + "/v2/shopping/flight-offers?" + query,
-                            headers={"Authorization": "Bearer " + self.token}).get("data", [])
+        body = json.dumps({"data": {
+            "slices": [
+                {"origin": origin, "destination": destination, "departure_date": departure},
+                {"origin": destination, "destination": origin, "departure_date": returning}],
+            "passengers": [{"type": "adult"}], "cabin_class": "economy"
+        }}).encode()
+        response = request_json(
+            "https://api.duffel.com/air/offer_requests?return_offers=true&supplier_timeout=20000",
+            body, {"Authorization": "Bearer " + self.token,
+                   "Duffel-Version": "v2", "Accept": "application/json",
+                   "Content-Type": "application/json"})["data"]
+        if response.get("live_mode") is not True:
+            raise APIError("Duffel returned test data. Enable live access and use a live token")
+        normalized = []
+        for offer in response["offers"]:
+            if offer.get("live_mode") is not True:
+                raise APIError("Refusing to send test offers as real flight deals")
+            if offer["total_currency"] != "EUR":
+                raise APIError("Duffel returned non-EUR fares. Configure EUR currency with Duffel")
+            expires = dt.datetime.fromisoformat(offer["expires_at"].replace("Z", "+00:00"))
+            if expires <= dt.datetime.now(dt.timezone.utc):
+                continue
+            normalized.append({
+                "price": {"currency": offer["total_currency"], "grandTotal": offer["total_amount"]},
+                "itineraries": [{"segments": [{
+                    "departure": {"iataCode": segment["origin"]["iata_code"], "at": segment["departing_at"]},
+                    "arrival": {"iataCode": segment["destination"]["iata_code"], "at": segment["arriving_at"]},
+                    "carrierCode": segment["marketing_carrier"]["iata_code"] or "?",
+                    "number": segment["marketing_carrier_flight_number"]
+                } for segment in part["segments"]]} for part in offer["slices"]]
+            })
+        return normalized
 
 
 class Telegram:
@@ -89,7 +106,7 @@ def load_config(path):
 
 
 def routes(config, today=None):
-    today = today or dt.date.today()
+    today = today or dt.datetime.now(ZoneInfo("Europe/Athens")).date()
     start = max(today + dt.timedelta(days=1), dt.date.fromisoformat(config["start_date"])
                 if config.get("start_date") else today + dt.timedelta(days=1))
     end = dt.date.fromisoformat(config["end_date"]) if config.get("end_date") else today + dt.timedelta(days=config["days_ahead"])
@@ -136,7 +153,7 @@ def offer_details(offer, route, limit):
     text = (f"✈️ Νέα προσφορά: {origin} ↔ {destination}\n{price:.2f} € / άτομο, με επιστροφή\n"
             f"{departure} – {returning} · 4 διανυκτερεύσεις\n{flights}\n"
             "Μόνο πτήσεις, χωρίς διαμονή. Έλεγξε αποσκευές και τελική τιμή πριν την κράτηση.\n"
-            "Πηγή: Amadeus · Η τιμή μπορεί να αλλάξει.")
+            "Πηγή: Duffel · Η τιμή μπορεί να αλλάξει.")
     return key, text
 
 
@@ -183,13 +200,18 @@ def main():
     parser.add_argument("--watch", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--check-config", action="store_true")
+    parser.add_argument("--limit", type=int, help="Maximum searches this run (e.g. 1 for smoke checks)")
     args = parser.parse_args()
     try:
         config = load_config(args.config)
+        if args.limit is not None:
+            if args.limit < 1:
+                raise ValueError("--limit must be positive")
+            config["requests_per_scan"] = min(config["requests_per_scan"], args.limit)
         if args.check_config:
             print(f"Configuration valid: {len(routes(config))} routes/dates")
             return
-        api = Amadeus()
+        api = Duffel()
         telegram = None if args.dry_run else Telegram()
         with connect(config["state_db"]) as db:
             while True:
@@ -198,7 +220,7 @@ def main():
                 except (APIError, ValueError, KeyError) as exc:
                     if not args.watch:
                         raise
-                    print(f"Scan failed ({type(exc).__name__}); retrying next interval", flush=True)
+                    print(f"Scan failed: {exc}; retrying next interval", flush=True)
                 if not args.watch:
                     break
                 time.sleep(config["interval_seconds"])
